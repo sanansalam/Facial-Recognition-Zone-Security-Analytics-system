@@ -7,16 +7,28 @@ import time
 class FrameMessage:
     cam_id:     str
     cam_label:  str
-    frame_jpeg: str       # base64 encoded JPEG string
+    frame_jpeg: str
     width:      int
     height:     int
     timestamp:  float = field(default_factory=time.time)
     sequence:   int   = 0
 
 @dataclass
+class MotionEvent:
+    cam_id:       str
+    motion_score: float
+    bbox:         List[int]
+    timestamp:    float = field(default_factory=time.time)
+
+@dataclass
+class MotionCleared:
+    cam_id:    str
+    timestamp: float = field(default_factory=time.time)
+
+@dataclass
 class Heartbeat:
     service_name: str
-    status:       str     # healthy | degraded | error
+    status:       str
     cpu_percent:  float
     mem_mb:       float
     uptime_sec:   float
