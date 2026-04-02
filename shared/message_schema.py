@@ -14,18 +14,6 @@ class FrameMessage:
     sequence:   int   = 0
 
 @dataclass
-class MotionEvent:
-    cam_id:       str
-    motion_score: float
-    bbox:         List[int]
-    timestamp:    float = field(default_factory=time.time)
-
-@dataclass
-class MotionCleared:
-    cam_id:    str
-    timestamp: float = field(default_factory=time.time)
-
-@dataclass
 class Heartbeat:
     service_name: str
     status:       str

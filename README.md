@@ -1,30 +1,22 @@
-# Facial Recognition & Zone Security (V2)
+# Facial Recognition & Zone Security Analytics System
 
-Version 2 adds **Motion Detection** to the video ingestion pipeline.
+This repository contains the progressive stages of the Edge AI Security system, organized into versioned folders.
 
-## Features
-- **Video Ingestion (V1)**: Multi-camera capture and ZMQ publishing.
-- **Motion Detection (V2)**: MOG2-based background subtraction per camera.
-- **Microservices Architecture**: Services communicate over ZeroMQ and run in Docker.
+## Folder Structure
 
-## Setup
-1. Copy `.env.example` to `.env`.
-2. Edit `.env` with your camera sources.
-3. Run with Docker Compose:
-   ```bash
-   docker-compose up --build
-   ```
+### [v1/](./v1) - Video Ingestion
+- Core service for camera discovery and frame streaming.
+- Standalone service with basic ZeroMQ publishing.
 
-## Verification (Is it working?)
-To verify V2:
-1. **Run the services** using `docker-compose up`.
-2. **Run the Debug Script**:
-   ```bash
-   python3 debug_check.py
-   ```
-   You should see the video window. If there is movement, a **RED BOX** will appear around the motion area.
+### [v2/](./v2) - Video Ingestion + Motion Detection
+- Adds a background subtraction service.
+- Includes a multi-service `docker-compose.yml` for unified deployment.
 
-## Git Versioning
-This project is built in stages:
-- **v1**: Video Ingestion only.
-- **v2**: Video Ingestion + Motion Detection.
+## How to use
+Each folder is a standalone version of the project at that stage. Navigate into a folder to see its specific setup instructions and code.
+
+```bash
+# Example: Running V2
+cd v2
+docker-compose up --build
+```
