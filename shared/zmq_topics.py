@@ -1,2 +1,6 @@
-RAW_FRAME = b"raw_frame"
-HEARTBEAT = b"heartbeat"
+RAW_FRAME        = b"raw_frame"
+HEARTBEAT        = b"heartbeat"
+MOTION_DETECTED  = b"motion_detected"
+MOTION_CLEARED   = b"motion_cleared"
+DETECTION_RESULT = b"detection_result"
+VIOLATION_EVENT  = b"violation_event"

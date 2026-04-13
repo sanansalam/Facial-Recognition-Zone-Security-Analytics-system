@@ -1,6 +1,12 @@
-import os
 from dataclasses import dataclass
 from typing import List, Union
+import os
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 @dataclass
 class CameraConfig:
@@ -10,9 +16,14 @@ class CameraConfig:
 
 @dataclass
 class ZMQPorts:
-    raw_frames: int
-    motion:     int
-    health:     int
+    raw_frames:       int
+    motion:           int
+    inference:        int
+    sop:              int
+    health_ingestion: int
+    health_motion:    int
+    health_inference: int
+    health_sop:       int
 
 @dataclass
 class Settings:
@@ -41,7 +52,12 @@ def get_settings() -> Settings:
         zmq=ZMQPorts(
             raw_frames=int(os.environ.get("ZMQ_RAW_FRAMES_PORT", 5550)),
             motion=int(os.environ.get("ZMQ_MOTION_PORT", 5551)),
-            health=int(os.environ.get("ZMQ_HEALTH_PORT", 5554)),
+            inference=int(os.environ.get("ZMQ_INFERENCE_PORT", 5552)),
+            sop=int(os.environ.get("ZMQ_VIOLATIONS_PORT", 5553)),
+            health_ingestion=int(os.environ.get("ZMQ_HEALTH_INGESTION", 5554)),
+            health_motion=int(os.environ.get("ZMQ_HEALTH_MOTION", 5555)),
+            health_inference=int(os.environ.get("ZMQ_HEALTH_INFERENCE", 5556)),
+            health_sop=int(os.environ.get("ZMQ_HEALTH_SOP", 5557)),
         ),
         motion_min_area=int(os.environ.get("MOTION_MIN_AREA", 500)),
         motion_blur_size=int(os.environ.get("MOTION_BLUR_SIZE", 21)),

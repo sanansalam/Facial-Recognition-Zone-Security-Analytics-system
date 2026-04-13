@@ -1,12 +1,108 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Edge AI Security Pipeline — Docker Compose
+#
+# Usage:
+#   docker-compose up --build          # start everything
+#   docker-compose up ai_inference     # start one service
+#   docker-compose down                # stop all
+#
+# Mount your videos and models on the host; containers read them as volumes.
+# ─────────────────────────────────────────────────────────────────────────────
+
+x-common: &common
+  restart: unless-stopped
+  env_file: .env
+  networks:
+    - edge_ai_net
+
 services:
+
+  # ── 1. Video Ingestion ────────────────────────────────────────────────────
   video_ingestion:
-    build: {context: ., dockerfile: video_ingestion/Dockerfile}
-    network_mode: host
-    env_file: .env
-    restart: always
-  motion_detection:
-    build: {context: ., dockerfile: motion_detection/Dockerfile}
-    network_mode: host
-    env_file: .env
-    restart: always
+    <<: *common
+    build: ./video_ingestion
+    container_name: video_ingestion
+    volumes:
+      - ./shared:/app/shared:ro
+      - ../edge_ai_security/data/videos:/data/videos:ro
+    environment:
+      - ZMQ_HOST=0.0.0.0
+    ports:
+      - "5550:5550"   # raw frames
+      - "5554:5554"   # health
+
+  # ── 2. Motion Detection ───────────────────────────────────────────────────
+  motion_detect:
+    <<: *common
+    build: ./motion_detection
+    container_name: motion_detect
     depends_on: [video_ingestion]
+    volumes:
+      - ./shared:/app/shared:ro
+    environment:
+      - ZMQ_HOST=video_ingestion
+    ports:
+      - "5551:5551"   # motion events
+      - "5555:5555"   # health
+
+  # ── 3. AI Inference ───────────────────────────────────────────────────────
+  ai_inference:
+    <<: *common
+    build: ./ai_inference
+    container_name: ai_inference
+    depends_on: [motion_detect]
+    volumes:
+      - ./shared:/app/shared:ro
+      - ./sop_state_machine:/app/sop_state_machine  # shared DB
+      - ../edge_ai_security/models:/models:ro
+      - ./yolo11n.pt:/app/yolo11n.pt:ro
+    environment:
+      - ZMQ_HOST=video_ingestion
+      - ZMQ_MOTION_PORT=5551
+      - MODEL_ROOT=/models/insightface
+      - YOLO_MODEL=/app/yolo11n.pt
+      - DB_PATH=/app/sop_state_machine/security.db
+    ports:
+      - "5552:5552"   # inference results
+      - "5556:5556"   # health
+      - "5558:5558"   # clip server
+
+  # ── 4. SOP State Machine ──────────────────────────────────────────────────
+  sop_state_mach:
+    <<: *common
+    build: ./sop_state_machine
+    container_name: sop_state_mach
+    depends_on: [ai_inference]
+    volumes:
+      - ./shared:/app/shared:ro
+      - ./sop_state_machine:/app/sop_state_machine  # writable — stores security.db
+    environment:
+      - ZMQ_HOST=ai_inference
+      - DB_PATH=/app/sop_state_machine/security.db
+      - SECURITY_DB=/app/sop_state_machine/security.db
+    ports:
+      - "5553:5553"   # violations
+      - "5557:5557"   # health
+
+  # ── 5. Event Logger ───────────────────────────────────────────────────────
+  event_logger:
+    <<: *common
+    build: ./event_logger
+    container_name: event_logger
+    depends_on: [sop_state_mach]
+    volumes:
+      - ./shared:/app/shared:ro
+      - ./sop_state_machine:/app/sop_state_machine:ro
+      - ./data:/app/data                             # writable — evidence, reports
+    environment:
+      - ZMQ_HOST=sop_state_mach
+      - DB_PATH=/app/sop_state_machine/security.db
+      - EVIDENCE_DIR=/app/data/evidence
+      - REPORTS_DIR=/app/data/reports
+      - CLIP_SERVER_HOST=ai_inference
+
+networks:
+  edge_ai_net:
+    driver: bridge
