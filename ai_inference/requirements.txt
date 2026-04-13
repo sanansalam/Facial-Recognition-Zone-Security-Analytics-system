@@ -1,0 +1,7 @@
+ultralytics
+insightface
+pyzmq
+psutil
+numpy
+opencv-python-headless
+onnxruntime

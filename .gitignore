@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Large model & video files
+*.pt
+*.onnx
+*.avi
+*.mp4
+*.mkv
+
+# Databases (contain sensitive enrollment data — back up separately)
+*.db
+*.db-shm
+*.db-wal
+
+# Evidence & reports (runtime output)
+data/evidence/
+data/reports/
+data/events.db
+
+# Enrolled face images (sensitive PII)
+data/enrolled_faces/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# dotenv — keep as template only
+# .env   ← keep this tracked so teammates know what vars to set
+
+# Edge AI Security parent data/ (large CCTV videos)
+edge_ai_security/data/videos/

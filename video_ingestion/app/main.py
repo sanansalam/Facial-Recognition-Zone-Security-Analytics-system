@@ -13,6 +13,7 @@ import signal
 import sys
 import threading
 import time
+import gc
 from collections import deque
 
 import cv2
@@ -21,6 +22,12 @@ import zmq
 
 from shared.message_schema import FrameMessage, Heartbeat, encode
 from shared.zmq_topics import RAW_FRAME, HEARTBEAT
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 # -- Logging --
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -37,18 +44,24 @@ def discover_cameras():
         source = os.getenv(f"CAM_{n}_SOURCE")
         if source is None:
             break
+        source = source.strip('"\'') # Remove any accidental quotes
         label = os.getenv(f"CAM_{n}_LABEL", f"Camera {n}")
         try:
-            source = int(source)
+            source_int = int(source)
             is_file = False
+            source = source_int
         except ValueError:
             is_file = True
+            if not os.path.exists(source):
+                log.error(f"Video file not found at: {source}")
+        
         cameras.append({
             "id":      f"cam_{n}",
             "source":  source,
             "label":   label,
             "is_file": is_file,
         })
+        log.info(f"Discovered: {label} -> {source} (File: {is_file})")
         n += 1
     return cameras
 
@@ -57,8 +70,6 @@ cameras = discover_cameras()
 if not cameras:
     log.error("No cameras found. Set CAM_0_SOURCE at minimum.")
     sys.exit(1)
-
-log.info(f"Discovered {len(cameras)} camera(s): {[c['label'] for c in cameras]}")
 
 stop_event  = threading.Event()
 socket_lock = threading.Lock()
@@ -75,8 +86,13 @@ stats = {
 }
 
 FRAME_SKIP      = int(os.getenv("FRAME_SKIP", "3"))
-ZMQ_FRAMES_PORT = int(os.getenv("ZMQ_RAW_FRAMES_PORT", "5550"))
-ZMQ_HEALTH_PORT = int(os.getenv("ZMQ_HEALTH_PORT", "5554"))
+MAX_DIM         = int(os.getenv("MAX_DIM", "1920")) # Cap resolution for RAM safety
+# -- Config --
+from shared.config import get_settings
+settings = get_settings()
+
+ZMQ_FRAMES_PORT = settings.zmq.raw_frames
+ZMQ_HEALTH_PORT = settings.zmq.health_ingestion
 
 def shutdown(sig, frame):
     log.info("Shutdown signal received")
@@ -136,31 +152,44 @@ def camera_thread(cam_id, cam_source, cam_label, is_file, frame_socket):
         if raw_count % FRAME_SKIP != 0:
             continue
 
-        frame = cv2.resize(frame, (640, 640))
-        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-        if not ok:
-            continue
-        frame_b64 = base64.b64encode(buf.tobytes()).decode("utf-8")
+        h_frame, w_frame = frame.shape[:2]
+        
+        # DOWN-SCALE IF EXCEEDS MAX_DIM
+        if max(h_frame, w_frame) > MAX_DIM:
+            scale = MAX_DIM / max(h_frame, w_frame)
+            new_w = int(w_frame * scale)
+            new_h = int(h_frame * scale)
+            frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            h_frame, w_frame = new_h, new_w
 
-        now = time.time()
-        fps_times.append(now)
+        frame_bytes = frame.tobytes()
+
+        # Explicitly clean up memory every 100 frames
+        if published_count % 100 == 0:
+            gc.collect()
+
+        now_proc = time.time()
+        fps_times.append(now_proc)
         fps = 0.0
         if len(fps_times) > 1:
-            elapsed = fps_times[-1] - fps_times[0]
-            if elapsed > 0:
-                fps = (len(fps_times) - 1) / elapsed
+            elapsed_proc = fps_times[-1] - fps_times[0]
+            if elapsed_proc > 0:
+                fps = (len(fps_times) - 1) / elapsed_proc
+
+        # Use real-time clock for all frames to ensure correct system timestamps
+        # even when ingesting from a file. This fixes the "1970" date issue.
+        frame_ts = now_proc
 
         msg = FrameMessage(
             cam_id     = cam_id,
             cam_label  = cam_label,
-            frame_jpeg = frame_b64,
-            width      = 640,
-            height     = 640,
-            timestamp  = now,
+            width      = w_frame,
+            height     = h_frame,
+            timestamp  = frame_ts,
             sequence   = published_count,
         )
         with socket_lock:
-            frame_socket.send_multipart([RAW_FRAME, encode(msg)])
+            frame_socket.send_multipart([RAW_FRAME, encode(msg), frame_bytes])
 
         with stats_lock:
             stats[cam_id]["fps"]       = fps
@@ -210,6 +239,7 @@ def heartbeat_loop(health_socket, start_time):
 def main():
     ctx = zmq.Context()
     frame_socket = ctx.socket(zmq.PUB)
+    frame_socket.setsockopt(zmq.SNDHWM, 2)
     frame_socket.bind(f"tcp://0.0.0.0:{ZMQ_FRAMES_PORT}")
     health_socket = ctx.socket(zmq.PUB)
     health_socket.bind(f"tcp://0.0.0.0:{ZMQ_HEALTH_PORT}")
