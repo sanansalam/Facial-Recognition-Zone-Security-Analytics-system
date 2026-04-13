@@ -12,7 +12,7 @@ Controls:
   's'         — skip frame (jump forward 100 frames)
 """
 
-import cv2, json, os, sys, sqlite3
+import cv2, json, os, sys, sqlite3, numpy as np
 sys.path.insert(0, os.path.dirname(__file__))
 
 VIDEO_PATH = os.getenv("CAM_0_SOURCE", "")
@@ -32,7 +32,7 @@ print(f"Video: {VIDEO_PATH}")
 
 # ─── State ───────────────────────────────────────────────────────────────────
 current_pts   = []   # points for the zone being drawn
-all_zones     = []   # list of {"name": str, "pts": list, "restricted": list}
+all_zones     = []   # list of {"name": str, "pts": list, "restricted": list, "is_corridor": bool}
 COLORS        = [(0,200,100),(0,100,255),(255,100,0),(180,0,255),(0,220,220),(255,180,0)]
 frame_display = None
 frame_clean   = None
@@ -43,12 +43,13 @@ def draw_overlay(img):
     for i, z in enumerate(all_zones):
         color = COLORS[i % len(COLORS)]
         pts_arr = [(int(p[0]), int(p[1])) for p in z["pts"]]
-        cv2.polylines(out, [cv2.UMat([(p,) for p in pts_arr])], True, color, 2)
+        pts_np = np.array(pts_arr, dtype=np.int32).reshape((-1, 1, 2))
+        cv2.polylines(out, [pts_np], True, color, 2)
         # Label at centroid
         cx = int(sum(p[0] for p in pts_arr) / len(pts_arr))
         cy = int(sum(p[1] for p in pts_arr) / len(pts_arr))
-        restricted = "🔒" if z["restricted"] else ""
-        cv2.putText(out, f"{z['name']} {restricted}", (cx-60, cy),
+        tag = "[CORRIDOR]" if z.get("is_corridor") else ("🔒" if z["restricted"] else "")
+        cv2.putText(out, f"{z['name']} {tag}", (cx-60, cy),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
     # Draw current in-progress zone
     for p in current_pts:
@@ -82,15 +83,22 @@ def mouse_cb(event, x, y, flags, param):
 def save_zones():
     conn = sqlite3.connect(DB_PATH)
     cur  = conn.cursor()
+    # Ensure is_corridor column exists (migration)
+    cols = [r[1] for r in cur.execute("PRAGMA table_info(zones)").fetchall()]
+    if "is_corridor" not in cols:
+        cur.execute("ALTER TABLE zones ADD COLUMN is_corridor INTEGER DEFAULT 0")
     cur.execute(f"DELETE FROM zones WHERE cam_id='{CAM_ID}'")
     for z in all_zones:
-        cur.execute("INSERT INTO zones (name, cam_id, polygon_points, restricted_roles) VALUES (?,?,?,?)",
-                    (z["name"], CAM_ID, json.dumps(z["pts"]), json.dumps(z["restricted"])))
+        cur.execute(
+            "INSERT INTO zones (name, cam_id, polygon_points, restricted_roles, is_corridor) VALUES (?,?,?,?,?)",
+            (z["name"], CAM_ID, json.dumps(z["pts"]), json.dumps(z["restricted"]), 1 if z.get("is_corridor") else 0)
+        )
     conn.commit()
     conn.close()
     print(f"\n✅ Saved {len(all_zones)} zones to {DB_PATH}")
     for z in all_zones:
-        print(f"  [{z['name']}] restricted={z['restricted']} pts={len(z['pts'])}")
+        corridor_tag = " [CORRIDOR]" if z.get("is_corridor") else ""
+        print(f"  [{z['name']}{corridor_tag}] restricted={z['restricted']} pts={len(z['pts'])}")
 
 def main():
     global current_pts, frame_display, frame_clean
@@ -159,11 +167,16 @@ def main():
             name = input(f"\nName for zone {len(all_zones)+1} (e.g. 'Locker Room'): ").strip()
             if not name:
                 name = f"Zone {len(all_zones)+1}"
-            restricted_input = input("Who is restricted? (comma-separated roles, e.g. 'visitor,customer', or ENTER for none): ").strip()
-            restricted = [r.strip() for r in restricted_input.split(",") if r.strip()]
+            is_corridor = input("Is this a CORRIDOR / transit path? Persons passing through won't be flagged (y/n) [n]: ").strip().lower() == "y"
+            if is_corridor:
+                restricted = []
+                print(f"Zone '{name}' marked as CORRIDOR — all persons auto-authorized here.")
+            else:
+                restricted_input = input("Who is restricted? (comma-separated roles, e.g. 'visitor,customer', or ENTER for none): ").strip()
+                restricted = [r.strip() for r in restricted_input.split(",") if r.strip()]
             # Scale coordinates back to original resolution
             scaled_pts = [[int(p[0]/scale), int(p[1]/scale)] for p in current_pts]
-            all_zones.append({"name": name, "pts": scaled_pts, "restricted": restricted})
+            all_zones.append({"name": name, "pts": scaled_pts, "restricted": restricted, "is_corridor": is_corridor})
             print(f"Zone '{name}' saved. {len(all_zones)} zones total.")
             current_pts = []
             cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)

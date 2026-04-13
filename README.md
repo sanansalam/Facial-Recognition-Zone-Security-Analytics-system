@@ -1,6 +1,8 @@
 # 🔐 Edge AI Security System
 
-A modular, real-time AI-powered CCTV security system that runs entirely on local hardware — no cloud required.
+A **generic, modular, real-time AI-powered CCTV security system** that runs entirely on local hardware — no cloud required.
+
+> **Note:** The jewelry shop CCTV footage is used only as a test dataset to validate the system works. The system is fully use-case agnostic — it adapts to any location (offices, banks, construction sites, warehouses, hospitals, etc.) simply by reconfiguring cameras, zones, and enrollment data.
 
 ## Features
 

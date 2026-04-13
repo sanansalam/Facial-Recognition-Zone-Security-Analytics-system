@@ -15,6 +15,7 @@ Run with:
 """
 
 import base64
+import collections
 import json
 import logging
 import os
@@ -58,6 +59,7 @@ ZMQ_VIOLATIONS_PORT = settings.zmq.sop       # actually 5553
 ZMQ_HEALTH_PORT     = settings.zmq.health_sop
 ZMQ_HOST            = os.getenv("ZMQ_HOST", "localhost")
 SIMILARITY_THRESH   = float(os.getenv("SIMILARITY_THRESH", "0.38"))
+DWELL_THRESHOLD_SEC = float(os.getenv("DWELL_THRESHOLD_SEC", "5.0"))  # secs before a transit becomes a violation
 
 THIS_DIR       = os.path.dirname(os.path.abspath(__file__))  # .../sop_state_machine/app
 SOP_DIR        = os.path.dirname(THIS_DIR)                   # .../sop_state_machine
@@ -75,6 +77,127 @@ SECURITY_DB_PATH = os.getenv(
 
 stop_event = threading.Event()
 
+# ── Cross-Camera Deduplicator ─────────────────────────────────────────────────
+#
+# When the same person is detected on multiple cameras within DEDUP_WINDOW_SEC,
+# only the detection with the highest face-confidence score is published.
+# Unknown persons are bucketed by a short position hash so separate unknowns
+# in different zones are still treated as independent events.
+
+DEDUP_WINDOW_SEC = 2.0  # seconds to wait before flushing
+
+class CrossCameraDeduplicator:
+    """
+    Buffers (violation_dict, pub_sock) tuples per person.
+    Every DEDUP_WINDOW_SEC a flush thread picks the best candidate
+    (highest conf_face) and publishes it.
+    """
+
+    def __init__(self):
+        # key: person_name  →  list of {viol, conf, ts}
+        self._buf: dict[str, list] = collections.defaultdict(list)
+        self._lock = threading.Lock()
+
+    def add(self, person_name: str, conf: float, viol: dict, pub_sock):
+        with self._lock:
+            self._buf[person_name].append({
+                "conf":     conf,
+                "viol":     viol,
+                "pub_sock": pub_sock,
+                "ts":       time.time(),
+            })
+
+    def flush(self):
+        """Called periodically — emit the best detection per person."""
+        now = time.time()
+        with self._lock:
+            to_flush = {}
+            remaining = collections.defaultdict(list)
+            for name, entries in self._buf.items():
+                expired  = [e for e in entries if now - e["ts"] >= DEDUP_WINDOW_SEC]
+                fresh    = [e for e in entries if now - e["ts"] <  DEDUP_WINDOW_SEC]
+                if expired:
+                    to_flush[name] = expired
+                remaining[name] = fresh
+            self._buf = remaining
+
+        for name, entries in to_flush.items():
+            best = max(entries, key=lambda e: e["conf"])
+            v    = best["viol"]
+            sock = best["pub_sock"]
+            # Log which camera won
+            if len(entries) > 1:
+                cams = [e["viol"]["cam_id"] for e in entries]
+                log.debug(
+                    f"[dedup] {name}: {len(entries)} cams {cams} → "
+                    f"best={v['cam_id']} (conf={best['conf']:.3f})"
+                )
+            sock.send_multipart([VIOLATION_EVENT, json.dumps(v).encode("utf-8")])
+
+
+_deduplicator = CrossCameraDeduplicator()
+
+
+def _flush_loop():
+    """Background thread: flush deduplicator every DEDUP_WINDOW_SEC."""
+    while not stop_event.is_set():
+        time.sleep(DEDUP_WINDOW_SEC)
+        try:
+            _deduplicator.flush()
+        except Exception as e:
+            log.error(f"Deduplicator flush error: {e}")
+
+
+# ── Dwell Tracker (Option 1) ──────────────────────────────────────────────────
+#
+# A person passing THROUGH a restricted zone should not trigger a violation.
+# Only fire if they STAY in the zone for >= DWELL_THRESHOLD_SEC seconds.
+
+class DwellTracker:
+    """
+    Tracks how long each (person, zone) pair has been present.
+    key = (person_name, zone_name)
+    value = {first_seen, last_seen, fired}
+    """
+    def __init__(self):
+        self._zones: dict = {}   # key → {first_seen, last_seen, fired}
+        self._lock = threading.Lock()
+
+    def update(self, key: tuple, now: float) -> bool:
+        """
+        Call every time the person is seen in this zone.
+        Returns True when the violation should fire for the first time.
+        """
+        with self._lock:
+            if key not in self._zones:
+                self._zones[key] = {"first_seen": now, "last_seen": now, "fired": False}
+                return False   # just entered — don't fire yet
+            entry = self._zones[key]
+            entry["last_seen"] = now
+            if entry["fired"]:
+                return False   # already fired once, don't spam
+            if now - entry["first_seen"] >= DWELL_THRESHOLD_SEC:
+                entry["fired"] = True
+                return True    # dwell threshold crossed → fire!
+            return False
+
+    def cleanup(self, now: float, timeout: float = 15.0):
+        """Remove stale entries (person hasn't been seen for >timeout seconds)."""
+        with self._lock:
+            stale = [k for k, v in self._zones.items() if now - v["last_seen"] > timeout]
+            for k in stale:
+                del self._zones[k]
+
+
+_dwell = DwellTracker()
+
+
+def _dwell_cleanup_loop():
+    """Background thread: prune stale dwell entries every 30 seconds."""
+    while not stop_event.is_set():
+        time.sleep(30)
+        _dwell.cleanup(time.time())
+
 
 def shutdown(sig, frame):
     log.info("Shutdown signal received")
@@ -88,7 +211,7 @@ signal.signal(signal.SIGTERM, shutdown)
 # ── Security DB setup ────────────────────────────────────────────────────────
 
 def init_security_db():
-    """Create zones and events tables if they don't exist."""
+    """Create zones and events tables. Migrate existing DBs for new columns."""
     conn = sqlite3.connect(SECURITY_DB_PATH)
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS zones (
@@ -96,7 +219,8 @@ def init_security_db():
             name             TEXT NOT NULL,
             cam_id           TEXT NOT NULL,
             polygon_points   TEXT NOT NULL,
-            restricted_roles TEXT DEFAULT '[]'
+            restricted_roles TEXT DEFAULT '[]',
+            is_corridor      INTEGER DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS events (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -111,35 +235,40 @@ def init_security_db():
             message     TEXT
         );
     """)
+    # Migration: add is_corridor to existing tables that lack it
+    existing_cols = [r[1] for r in conn.execute("PRAGMA table_info(zones)").fetchall()]
+    if "is_corridor" not in existing_cols:
+        conn.execute("ALTER TABLE zones ADD COLUMN is_corridor INTEGER DEFAULT 0")
+        conn.commit()
+        log.info("Migrated zones table: added is_corridor column")
     conn.commit()
     conn.close()
     log.info(f"Security DB initialised at {SECURITY_DB_PATH}")
 
 
 def get_all_zones(frame_w: int = 2880, frame_h: int = 1620):
-    """Return all zones regardless of camera. Seed a default zone if none exist."""
+    """Return all zones regardless of camera. Includes is_corridor flag."""
     conn = sqlite3.connect(SECURITY_DB_PATH)
     rows = conn.execute(
-        "SELECT id, name, polygon_points, restricted_roles FROM zones"
+        "SELECT id, name, polygon_points, restricted_roles, is_corridor FROM zones"
     ).fetchall()
     if not rows:
-        # Seed a full-frame default zone (unrestricted)
         conn.execute(
-            "INSERT INTO zones (name, cam_id, polygon_points, restricted_roles) VALUES (?,?,?,?)",
+            "INSERT INTO zones (name, cam_id, polygon_points, restricted_roles, is_corridor) VALUES (?,?,?,?,?)",
             ("Default Zone", "any",
              json.dumps([[0, 0], [frame_w, 0], [frame_w, frame_h], [0, frame_h]]),
-             json.dumps([]))
+             json.dumps([]), 0)
         )
         conn.commit()
         rows = conn.execute(
-            "SELECT id, name, polygon_points, restricted_roles FROM zones"
+            "SELECT id, name, polygon_points, restricted_roles, is_corridor FROM zones"
         ).fetchall()
-        log.info(f"Seeded default universal zone.")
+        log.info("Seeded default universal zone.")
     conn.close()
     return rows
 
 def find_zone(bbox: list, frame_w=2880, frame_h=1620):
-    """Find which zone a person's feet (bottom-center of bbox) are in."""
+    """Find which zone a person's feet are in. Returns zone dict with is_corridor flag."""
     if not bbox or len(bbox) < 4:
         return None, "Unknown Zone"
     x1, y1, x2, y2 = bbox
@@ -148,7 +277,7 @@ def find_zone(bbox: list, frame_w=2880, frame_h=1620):
 
     import cv2, ast
     zones = get_all_zones(frame_w, frame_h)
-    for zid, zname, zpts_json, restricted_json in zones:
+    for zid, zname, zpts_json, restricted_json, is_corridor in zones:
         try:
             pts = json.loads(zpts_json)
         except (json.JSONDecodeError, ValueError):
@@ -162,16 +291,20 @@ def find_zone(bbox: list, frame_w=2880, frame_h=1620):
                 restricted = json.loads(restricted_json)
             except (json.JSONDecodeError, ValueError):
                 restricted = ast.literal_eval(restricted_json) if restricted_json else []
-            return {"id": zid, "name": zname, "restricted_roles": restricted}, zname
-    # No polygon matched → fall back to Common Area (unrestricted) instead of Unknown Zone
-    for zid, zname, zpts_json, restricted_json in zones:
+            return {
+                "id": zid, "name": zname,
+                "restricted_roles": restricted,
+                "is_corridor": bool(is_corridor),
+            }, zname
+    # Fallback → Common Area
+    for zid, zname, zpts_json, restricted_json, is_corridor in zones:
         if "common area" in zname.lower():
             try:
                 restricted = json.loads(restricted_json)
             except Exception:
                 restricted = []
-            return {"id": zid, "name": zname, "restricted_roles": restricted}, zname
-    return {"id": -1, "name": "Common Area", "restricted_roles": []}, "Common Area"
+            return {"id": zid, "name": zname, "restricted_roles": restricted, "is_corridor": bool(is_corridor)}, zname
+    return {"id": -1, "name": "Common Area", "restricted_roles": [], "is_corridor": False}, "Common Area"
 
 
 def log_event(cam_id, zone_name, person_id, person_name, person_role, status, confidence, message):
@@ -262,8 +395,14 @@ def process_detection(result: DetectionResult, pub_sock: zmq.Socket, frame: np.n
         zone, zone_name = find_zone(bbox)
         fx, fy = (bbox[0] + bbox[2]) / 2, bbox[3]
 
+        # ── Option 2: Corridor zones are always AUTHORIZED ─────────────────
+        is_corridor = zone.get("is_corridor", False) if zone else False
+
         # Authorization logic
-        if person_name == "Unknown" or person_id == -1:
+        if is_corridor:
+            status  = "AUTHORIZED"
+            message = f"{person_name} transiting through corridor '{zone_name}'"
+        elif person_name == "Unknown" or person_id == -1:
             if "common area" in zone_name.lower():
                 status  = "AUTHORIZED"
                 message = f"Unrecognised person in permitted Common Area"
@@ -279,6 +418,20 @@ def process_detection(result: DetectionResult, pub_sock: zmq.Socket, frame: np.n
         else:
             status  = "AUTHORIZED"
             message = f"{person_name} ({person_role}) authorized in {zone_name}"
+
+        # ── Option 1: Dwell time gate (non-AUTHORIZED only) ─────────────────
+        # Don't fire immediately — wait until person has been in zone for DWELL_THRESHOLD_SEC
+        if status != "AUTHORIZED":
+            dwell_key = (person_name, zone_name)
+            now_dwell = time.time()
+            should_fire = _dwell.update(dwell_key, now_dwell)
+            if not should_fire:
+                # Still within grace period — log at DEBUG only, skip violation
+                log.debug(
+                    f"[dwell] {person_name} in {zone_name} ({cam_id}) — "
+                    f"waiting for {DWELL_THRESHOLD_SEC}s threshold"
+                )
+                continue   # skip the rest of the loop body for this detection
 
         # Log
         severity_map = {
@@ -307,7 +460,7 @@ def process_detection(result: DetectionResult, pub_sock: zmq.Socket, frame: np.n
             except Exception as e:
                 log.error(f"Error cropping evidence: {e}")
 
-        # Publish violation event as a simple JSON dict on port 5553
+        # Build violation payload
         viol = {
             "cam_id":        cam_id,
             "cam_label":     cam_label,
@@ -321,7 +474,18 @@ def process_detection(result: DetectionResult, pub_sock: zmq.Socket, frame: np.n
             "timestamp":     result.timestamp,
             "evidence_jpeg": evidence_b64,
         }
-        pub_sock.send_multipart([VIOLATION_EVENT, json.dumps(viol).encode("utf-8")])
+
+        # ── Cross-camera deduplication ────────────────────────────────────
+        # AUTHORIZED events pass straight through (no spam risk).
+        # UNKNOWN/RESTRICTED go through the deduplicator so the same person
+        # seen on N cameras within DEDUP_WINDOW_SEC only fires once (best conf).
+        if status == "AUTHORIZED":
+            pub_sock.send_multipart([VIOLATION_EVENT, json.dumps(viol).encode("utf-8")])
+        else:
+            # Use person_name for known persons; for unknowns bucket by zone
+            # so separate unknowns in different zones are independent.
+            dedup_key = person_name if person_name != "Unknown" else f"Unknown_{zone_name}"
+            _deduplicator.add(dedup_key, conf_face, viol, pub_sock)
 
 
 def main():
@@ -345,8 +509,17 @@ def main():
     # Health heartbeat
     health_sock = ctx.socket(zmq.PUB)
     health_sock.bind(f"tcp://0.0.0.0:{ZMQ_HEALTH_PORT}")
-    threading.Thread(target=heartbeat_loop, args=(health_sock, time.time()), 
+    threading.Thread(target=heartbeat_loop, args=(health_sock, time.time()),
                      daemon=True, name="heartbeat").start()
+
+    # Start cross-camera deduplication flush loop
+    threading.Thread(target=_flush_loop, daemon=True, name="dedup_flush").start()
+    log.info(f"Cross-camera deduplicator active (window={DEDUP_WINDOW_SEC}s)")
+
+    # Start dwell tracker cleanup loop
+    threading.Thread(target=_dwell_cleanup_loop, daemon=True, name="dwell_cleanup").start()
+    log.info(f"Dwell tracker active (threshold={DWELL_THRESHOLD_SEC}s)")
+
 
     log.info("SOP State Machine ready. Waiting for detections...")
 
