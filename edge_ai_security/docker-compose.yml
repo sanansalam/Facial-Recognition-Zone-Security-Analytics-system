@@ -1,0 +1,86 @@
+networks:
+  ainet:
+    driver: bridge
+
+# volumes:
+#   data_vol:
+#     driver: local
+
+services:
+
+  video_ingestion:
+    build:
+      context: .
+      dockerfile: video_ingestion/Dockerfile
+    container_name: video_ingestion
+    env_file: .env
+    networks: [ ainet ]
+    volumes:
+      - ./models:/models
+      - ./data:/data
+    devices:
+      - /dev/video0:/dev/video0
+    restart: unless-stopped
+
+  motion_detection:
+    build:
+      context: .
+      dockerfile: motion_detection/Dockerfile
+    container_name: motion_detection
+    env_file: .env
+    networks: [ ainet ]
+    restart: unless-stopped
+    depends_on:
+      - video_ingestion
+
+  ai_inference:
+    build:
+      context: .
+      dockerfile: ai_inference/Dockerfile
+    container_name: ai_inference
+    env_file: .env
+    networks: [ ainet ]
+    volumes:
+      - ./models:/models
+    restart: unless-stopped
+    depends_on:
+      - motion_detection
+
+  sop_state_machine:
+    build:
+      context: .
+      dockerfile: sop_state_machine/Dockerfile
+    container_name: sop_state_machine
+    env_file: .env
+    networks: [ ainet ]
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
+    depends_on:
+      - ai_inference
+
+  event_logger:
+    build:
+      context: .
+      dockerfile: event_logger/Dockerfile
+    container_name: event_logger
+    env_file: .env
+    networks: [ ainet ]
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
+    depends_on:
+      - sop_state_machine
+
+  health_watchdog:
+    build:
+      context: .
+      dockerfile: health_watchdog/Dockerfile
+    container_name: health_watchdog
+    env_file: .env
+    networks: [ ainet ]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped

@@ -1,0 +1,36 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# OS
+.DS_Store
+
+# Environments
+.env
+.venv/
+env/
+venv/
+ENV/
+
+# Large Binaries
+cloudflared
+*.onnx
+*.pt
+yolo11n.pt
+
+# Data & Evidence
+data/
+jobs/
+security_webapp/jobs/
+*.jpg
+*.jpeg
+*.png
+*.mp4
+*.avi
+*.txt
+*.html
+
+# Logs
+pipeline_log.txt
+uvicorn_log.txt

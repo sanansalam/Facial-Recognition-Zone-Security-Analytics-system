@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+models/*.onnx
+models/*.hef
+models/*.pt
+data/clips/
+data/*.db
+*.egg-info/

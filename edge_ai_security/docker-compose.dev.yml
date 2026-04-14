@@ -1,0 +1,19 @@
+version: "3.9"
+services:
+  ai_inference:
+    environment:
+      - INFERENCE_DEVICE=cpu
+      - HARDWARE_TARGET=cpu_only
+    ports:
+      - "5552:5552"
+
+  video_ingestion:
+    volumes:
+      - ./data/videos:/data/videos
+    ports:
+      - "5550:5550"
+      - "5554:5554"
+
+  motion_detection:
+    ports:
+      - "5551:5551"
