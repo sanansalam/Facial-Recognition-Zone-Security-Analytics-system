@@ -8,8 +8,7 @@ A **generic, modular, real-time AI-powered CCTV security system** that runs enti
 
 - 👁️ **Real-time person detection** using YOLOv11
 - 🧠 **Face recognition** using InsightFace (ArcFace)
-- 🗺️ **Zone-based access control** — define restricted areas per camera
-- 🎬 **Video evidence capture** — 10s rolling clip saved on violation
+- 📸 **Fast Face Verification** — Optimal frontal face extraction and storage
 - 🖥️ **Web enrollment dashboard** — add persons via webcam or photo upload
 - 📄 **Auto security reports** generated on shutdown
 - 🔔 **Instant desktop alerts** via `notify-send`
@@ -49,17 +48,23 @@ CAM_1_LABEL=Front Door
 
 ### 3. Enroll persons (first time)
 
+### 3. Enroll persons (first time)
+
 ```bash
 python3 enrollment_dashboard.py
 ```
-Open **http://localhost:7860** → capture face via webcam or upload a photo → assign name, role, and zones.
+Open **http://localhost:7860** → capture face via webcam or photo upload -> assign name, role, and zones.
+
+### 4. Draw zones (first time)
 
 ### 4. Draw zones (first time)
 
 ```bash
-python3 draw_zones.py
+cd ../edge_ai_security
+python3 scripts/draw_zones_only.py
+cd ../video_ingestion_standalone
 ```
-Click to define polygons for restricted areas on each camera frame.
+Click to define translucent colored polygons for restricted areas on each camera frame.
 
 ### 5. Run the system
 
@@ -92,7 +97,6 @@ video_ingestion_standalone/
 │   ├── evidence/           # Violation video clips & snapshots
 │   └── reports/            # End-of-session security reports
 ├── enrollment_dashboard.py # Web UI for person enrollment (Gradio)
-├── draw_zones.py           # Tool to draw zone polygons on camera frames
 ├── system_reset.py         # Clears events/evidence, keeps enrollment
 ├── run_all.py              # Launches all 5 services
 ├── docker-compose.yml      # Optional Docker deployment
@@ -121,12 +125,14 @@ Each zone can have a list of **restricted roles** — any person with that role 
 
 ## Evidence
 
-- **Known persons** → `.mp4` video clip (10s pre-violation)
-- **Unknown persons** → `.jpg` snapshot
+## Evidence
 
-Evidence is stored in `data/evidence/` with filename format:
+- Uses dynamic ZMQ buffering to capture the clearest, highest-confidence facial frame.
+- Saved directly to `data/evidence/` as Base64 decoded high-definition `.jpg` files.
+
+Filename format:
 ```
-cam_0_20260413_112647_remya.mp4
+cam_0_1776158775_Unknown_8b754f.jpg
 ```
 
 ---

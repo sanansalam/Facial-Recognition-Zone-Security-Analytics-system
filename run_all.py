@@ -106,11 +106,15 @@ def main():
 
     # Keep main thread alive
     while True:
-        # Check if any critical service died
+        # Check if any critical service died or finished
         for name, proc in procs:
-            if proc.poll() is not None and proc.returncode != 0:
-                print(f"\n⚠️  [{name.strip()}] died unexpectedly! Stopping all...")
-                shutdown(None, None)
+            if proc.poll() is not None:
+                if proc.returncode != 0:
+                    print(f"\n⚠️  [{name.strip()}] died unexpectedly! Stopping all...")
+                    shutdown(None, None)
+                elif "video_ingestion" in name:
+                    print("\n🎬 All videos finished playing! Generating final security report...")
+                    shutdown(None, None)
         time.sleep(2)
 
 

@@ -135,10 +135,8 @@ def camera_thread(cam_id, cam_source, cam_label, is_file, frame_socket):
 
         if not ret:
             if is_file:
-                log.info(f"[{cam_id}] End of video — looping back to start")
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                raw_count = 0
-                continue
+                log.info(f"[{cam_id}] End of video — breaking thread")
+                break
             else:
                 consecutive_fails += 1
                 if consecutive_fails > 30:
@@ -261,9 +259,16 @@ def main():
     threading.Thread(target=heartbeat_loop, args=(health_socket, start_time), 
                      daemon=True, name="heartbeat").start()
 
-    stop_event.wait()
+    # Block until all threads exit natively or stop_event is set
     for t in threads:
-        t.join(timeout=8)
+        while t.is_alive():
+            t.join(timeout=1.0)
+            if stop_event.is_set():
+                break
+
+    log.info("All camera threads have stopped.")
+    stop_event.set()  # Ensure heartbeat thread also stops
+    time.sleep(5)
     frame_socket.close()
     health_socket.close()
     ctx.term()

@@ -60,18 +60,13 @@ DEFAULT_MODELS = os.path.join(PARENT_DIR, "edge_ai_security", "models")
 DB_PATH             = os.getenv("DB_PATH", DEFAULT_DB)
 MODEL_ROOT          = os.getenv("MODEL_ROOT", DEFAULT_MODELS)
 YOLO_MODEL          = os.getenv("YOLO_MODEL", os.path.join(PARENT_DIR, "edge_ai_security", "yolo11n.pt"))
-SIMILARITY_THRESH   = float(os.getenv("SIMILARITY_THRESH", "0.35"))
+SIMILARITY_THRESH   = float(os.getenv("SIMILARITY_THRESH", "0.25"))
 MARGIN_THRESH       = float(os.getenv("MARGIN_THRESH", "0.02"))   # min gap between 1st and 2nd place
 MIN_FACE_PX         = int(os.getenv("MIN_FACE_PX", "35"))          # allow smaller CCTV faces
 VOTE_WINDOW         = 2   # frames that must agree before confirming identity
 ZMQ_MOTION_PORT     = int(os.getenv("ZMQ_MOTION_PORT", "5551"))
 
-# Per camera ring buffer — stores compressed JPEG bytes
-# 150 frames at ~10KB each = 1.5MB per camera
-RING_BUFFER_MAXLEN = 150
-ring_buffers: dict[str, collections.deque] = {}
-ring_lock = threading.Lock()
-# Each entry: {"ts": float, "jpg": bytes, "cam_id": str}
+
 
 stop_event = threading.Event()
 
@@ -95,9 +90,6 @@ motion_states = {} # cam_id -> bool
 vote_buffers = collections.defaultdict(lambda: collections.deque(maxlen=VOTE_WINDOW))
 vote_lock = threading.Lock()
 buffer_lock = threading.Lock()
-ring_lock = threading.Lock()
-RING_BUFFER_MAXLEN = 150 # 15 seconds at 10 fps
-ring_buffers = {} # cam_id -> deque
 
 # Identity persistence cache: key=(cam_id, track_id), value=(name, role, id, last_seen)
 identity_cache = {}
@@ -223,29 +215,10 @@ def thread_a_collector(ctx: zmq.Context):
         if not motion_states.get(msg.cam_id, True):
             continue
 
-        # -- ADD TO RING BUFFER --
-        # Compress aggressively to save RAM (Quality 40)
-        frame_raw = np.frombuffer(frame_bytes, dtype=np.uint8).reshape((msg.height, msg.width, 3))
-        with ring_lock:
-            # 2. Add to Ring Buffer (Compressed to save RAM)
-            with buffer_lock:
-                if msg.cam_id not in ring_buffers:
-                    ring_buffers[msg.cam_id] = collections.deque(maxlen=RING_BUFFER_MAXLEN)
-                
-                # Compress to JPEG Quality 40
-                frame_arr = np.frombuffer(frame_bytes, dtype=np.uint8).reshape((msg.height, msg.width, 3))
-                _, buf = cv2.imencode('.jpg', frame_arr, [cv2.IMWRITE_JPEG_QUALITY, 40])
-                
-                ring_buffers[msg.cam_id].append({
-                    'timestamp': msg.timestamp,
-                    'frame': buf.tobytes()
-                })
-            
-            # 3. Queue for YOLO (skip if inference too slow)
-            if queue_b.full():
-                try: queue_b.get_nowait()
-                except: pass
-            queue_b.put((msg.cam_id, frame_bytes, msg.timestamp, msg.width, msg.height, msg.cam_label))
+        if queue_b.full():
+            try: queue_b.get_nowait()
+            except: pass
+        queue_b.put((msg.cam_id, frame_bytes, msg.timestamp, msg.width, msg.height, msg.cam_label))
             
     log.info("Thread A stopped.")
 
@@ -318,8 +291,13 @@ def thread_c_identifier():
                                 if face.normed_embedding is not None:
                                     emb = face.normed_embedding
                                     raw_id, raw_name, raw_role, raw_sim = db.find_match(emb)
-                                    p_id, p_name, p_role, conf_face = raw_id, raw_name, raw_role, raw_sim
-                                    
+                                    if raw_name == "Unknown":
+                                        # Use the native face detection confidence so the deduplicator 
+                                        # knows which frame has the clearest face!
+                                        p_id, p_name, p_role = raw_id, raw_name, raw_role
+                                        conf_face = float(face.det_score)
+                                    else:
+                                        p_id, p_name, p_role, conf_face = raw_id, raw_name, raw_role, float(raw_sim)
                                     # Update cache if identified
                                     if p_name != "Unknown":
                                         with identity_lock:
@@ -348,105 +326,7 @@ def thread_c_identifier():
             log.error(f"Identifier error: {e}")
     log.info("Thread C stopped.")
 
-def extract_clip_from_buffer(clip_frames: List[dict]) -> bytes:
-    """
-    Extract frames from ring buffer around violation timestamp.
-    Returns mp4 video as bytes.
-    """
-    if len(clip_frames) < 5:
-        return b""
 
-    # Decode JPEG bytes back to numpy arrays
-    decoded = []
-    for entry in clip_frames:
-        arr = np.frombuffer(entry["frame"], dtype=np.uint8)
-        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if frame is not None:
-            decoded.append(frame)
-
-    if not decoded:
-        return b""
-
-    # Write mp4 to BytesIO in memory via tempfile
-    import tempfile
-    tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
-    tmp_name = tmp.name
-    tmp.close()
-
-    try:
-        h, w = decoded[0].shape[:2]
-        writer = cv2.VideoWriter(
-            tmp_name,
-            cv2.VideoWriter_fourcc(*'mp4v'),
-            10.0,
-            (w, h)
-        )
-        for frame in decoded:
-            writer.write(frame)
-        writer.release()
-
-        with open(tmp_name, "rb") as f:
-            clip_bytes = f.read()
-    finally:
-        if os.path.exists(tmp_name):
-            os.unlink(tmp_name)
-
-    return clip_bytes
-
-def thread_clip_server(ctx: zmq.Context):
-    """Responds to clip requests from event_logger on port 5558."""
-    socket = ctx.socket(zmq.REP)
-    socket.bind("tcp://0.0.0.0:5558")
-    socket.setsockopt(zmq.RCVTIMEO, 1000)
-    socket.setsockopt(zmq.LINGER, 0)
-    log.info("Clip server listening on port 5558")
-
-    while not stop_event.is_set():
-        try:
-            msg_bytes = socket.recv()
-            req = json.loads(msg_bytes.decode())
-            cam_id = req.get("cam_id")
-            request_ts = req.get("timestamp")
-            log.info(f"Clip request received: cam={cam_id}, ts={request_ts}")
-
-            if cam_id not in ring_buffers:
-                log.warning(f"Cam {cam_id} not in ring_buffers")
-                socket.send(b"NO_CLIP")
-                continue
-
-            with buffer_lock:
-                buf_snap = list(ring_buffers[cam_id])
-            
-            if not buf_snap:
-                log.warning(f"Ring buffer for {cam_id} is empty")
-                socket.send(b"NO_CLIP")
-                continue
-
-            clip_frames = [
-                f for f in buf_snap
-                if abs(f['timestamp'] - request_ts) <= 5.0
-            ]
-            
-            if len(clip_frames) < 5:
-                # Log the range of the buffer to debug timestamp mismatch
-                first_ts = buf_snap[0]['timestamp']
-                last_ts = buf_snap[-1]['timestamp']
-                log.info(f"Not enough frames for clip: found {len(clip_frames)} in range {first_ts:.2f}-{last_ts:.2f} (req={request_ts:.2f})")
-                socket.send(b"NO_CLIP")
-                continue
-            
-            log.info(f"Assembling clip for {cam_id} ({len(clip_frames)} frames)...")
-            clip_bytes = extract_clip_from_buffer(clip_frames)
-            socket.send(clip_bytes if clip_bytes else b"NO_CLIP")
-            
-        except zmq.Again:
-            continue
-        except Exception as e:
-            log.warning(f"Clip server error: {e}")
-            try:
-                socket.send(b"NO_CLIP")
-            except:
-                pass
 
 def thread_d_publisher(ctx: zmq.Context):
     socket = ctx.socket(zmq.PUB)
@@ -509,7 +389,6 @@ def main():
         threading.Thread(target=thread_b_filter, name="Filter-ThreadB"),
         threading.Thread(target=thread_c_identifier, name="Identifier-ThreadC"),
         threading.Thread(target=thread_d_publisher, args=(ctx,), name="Publisher-ThreadD"),
-        threading.Thread(target=thread_clip_server, args=(ctx,), name="ClipServer-REP"),
         threading.Thread(target=heartbeat_loop, args=(ctx, start_time), name="Heartbeat", daemon=True)
     ]
 

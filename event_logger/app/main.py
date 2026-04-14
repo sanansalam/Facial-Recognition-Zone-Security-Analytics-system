@@ -49,10 +49,7 @@ ZMQ_HOST           = os.getenv("ZMQ_HOST", "localhost")
 stop_event = threading.Event()
 cooldown_dict = {}  # key: f"{person_name}_{zone_name}_{cam_id}", val: timestamp
 last_heartbeats = {} # key: service_name, val: timestamp
-clip_socket = None # ZMQ REQ for clips
-clip_lock = threading.Lock()
-clip_queue = collections.deque() # To-be-processed clip requests
-clip_worker_lock = threading.Lock()
+
 
 # DB Setup
 def get_db():
@@ -170,11 +167,16 @@ def generate_report():
         count = pdata["count"]
         lines.append(f"  {pname:10s} ({role:10s}) → AUTHORIZED {count} times")
         
-    lines.extend(["", "VIOLATION DETAILS"])
+    lines.extend(["", "VIOLATION DETAILS (INCLUDING AUTHORIZED)"])
     for v in violations:
         dtstr = datetime.fromisoformat(v["timestamp"]).strftime('%H:%M:%S')
-        lines.append(f"  {dtstr} | {v['status']:10s} | {v['person_name']:10s} | {v['zone_name']} | {v['cam_id']}")
         
+        if v["status"] == "AUTHORIZED":
+            lines.append(f"  {dtstr} | {v['status']:10s} | {v['person_name']:10s} | {v['zone_name']} | {v['cam_id']} | [No evidence needed]")
+        else:
+            lines.append(f"  {dtstr} | {v['status']:10s} | {v['person_name']:10s} | {v['zone_name']} | {v['cam_id']} | "
+                         f"[Image Evidence: {os.path.basename(v['evidence_path']) if v['evidence_path'] else 'None'}]")
+
     lines.extend(["", "EVIDENCE FILES"])
     for ef in evidence_files[-10:]:  # max 10 to keep report clean
         lines.append(f"  {ef}")
@@ -186,78 +188,66 @@ def generate_report():
     with open(report_file, "w") as f:
         f.write(report_text)
         
+    # --- Generate HTML Report ---
+    html = [
+        "<html><head><title>Security Report</title><style>",
+        "body { font-family: sans-serif; padding: 20px; color: #333; }",
+        "table { border-collapse: collapse; width: 100%; margin-top: 20px; }",
+        "th, td { border: 1px solid #ccc; padding: 10px; text-align: left; }",
+        "th { background-color: #f4f4f4; }",
+        ".unknown { color: #d97706; font-weight: bold; }",
+        ".restricted { color: #dc2626; font-weight: bold; }",
+        ".authorized { color: #16a34a; font-weight: bold; }",
+        "</style></head><body>",
+        "<h1>SECURITY REPORT &mdash; Jewellery Shop</h1>",
+        f"<p><strong>Generated:</strong> {now.strftime('%Y-%m-%d %H:%M:%S')}<br/>",
+        f"<strong>Period:</strong> {datetime.fromtimestamp(time_threshold).strftime('%Y-%m-%d %H:%M:%S')} to {now.strftime('%H:%M:%S')}</p>",
+        "<h2>Summary</h2><ul>",
+        f"<li>Total violations: {total_viols}</li>",
+        f"<li>Unknown persons: {unknowns}</li>",
+        f"<li>Restricted access: {restricted}</li>",
+        f"<li>Cameras monitored: {len(cam_counts)}</li></ul>",
+        "<h2>Violations By Camera</h2><ul>"
+    ]
+    for cid, count in sorted(cam_counts.items(), key=lambda x: -x[1]):
+        html.append(f"<li>{cid} ({cam_labels[cid]}): {count} violations</li>")
+    html.append("</ul><h2>Violations By Zone</h2><ul>")
+    for zname, count in sorted(zone_counts.items(), key=lambda x: -x[1]):
+        html.append(f"<li>{zname}: {count}</li>")
+    
+    import urllib.parse
+    html.extend(["</ul><h2>Event Details</h2>", "<table>",
+                 "<tr><th>Time</th><th>Status</th><th>Person</th><th>Zone</th><th>Camera</th><th>Image Evidence</th></tr>"])
+    
+    for v in violations:
+        dtstr = datetime.fromisoformat(v["timestamp"]).strftime('%H:%M:%S')
+        status_cls = v["status"].lower()
+        
+        if v["status"] == "AUTHORIZED":
+            img_td = "<td>-</td>"
+        else:
+            ev_image = os.path.basename(v["evidence_path"]) if v["evidence_path"] else ""
+            
+            if ev_image:
+                img_td = f"<td><img src='../evidence/{ev_image}' style='height:150px; border-radius:5px;' alt='{ev_image}'></td>"
+            else:
+                img_td = "<td>-</td>"
+            
+        html.append(f"<tr><td>{dtstr}</td><td class='{status_cls}'><b>{v['status']}</b></td><td>{v['person_name']}</td>"
+                    f"<td>{v['zone_name']}</td><td>{v['cam_id']}</td>"
+                    f"{img_td}</tr>")
+        
+    html.append("</table></body></html>")
+    
+    html_file = report_file.replace(".txt", ".html")
+    with open(html_file, "w") as f:
+        f.write("\n".join(html))
+        
     print("\n" + report_text + "\n", flush=True)
-    log.info(f"Report generated: {report_file}")
+    log.info(f"Report generated: {report_file} (and .html)")
     conn.close()
 
-def clip_worker_thread():
-    """Background thread to process clip requests without blocking alerts."""
-    log.info("Clip worker thread started.")
-    while not stop_event.is_set():
-        if not clip_queue:
-            time.sleep(0.5)
-            continue
-            
-        with clip_worker_lock:
-            try:
-                cam_id, timestamp, person_name, ev_path_container = clip_queue.popleft()
-            except IndexError:
-                continue
-        
-        log.info(f"Background: Requesting evidence clip for {cam_id} at {timestamp}...")
-        clip_bytes = request_clip(cam_id, timestamp)
-        
-        if clip_bytes:
-            ts_str = datetime.fromtimestamp(timestamp).strftime("%Y%m%d_%H%M%S")
-            c_path = os.path.join(EVIDENCE_DIR, f"{cam_id}_{ts_str}_{person_name.replace(' ','_')}.mp4")
-            try:
-                with open(c_path, "wb") as f:
-                    f.write(clip_bytes)
-                log.info(f"Evidence clip saved: {c_path} ({len(clip_bytes)//1024} KB)")
-                # Update the database record if possible? 
-                # For now, we just save the file. The original event already points to the JPG or the MP4 path we predicted.
-            except Exception as e:
-                log.error(f"Failed to save background clip: {e}")
-        else:
-            log.warning(f"No clip returned for {cam_id} at {timestamp}")
 
-def request_clip(cam_id, timestamp):
-    """Requests .mp4 bytes from ai_inference on port 5555."""
-    global clip_socket
-    if clip_socket is None:
-        return None
-    
-    with clip_lock:
-        try:
-            req = json.dumps({
-                "cam_id": cam_id,
-                "timestamp": timestamp
-            }).encode()
-            clip_socket.send(req)
-            
-            # Use long timeout
-            clip_bytes = clip_socket.recv()
-            if clip_bytes == b"NO_CLIP" or not clip_bytes:
-                return None
-            return clip_bytes
-        except zmq.ZMQError as e:
-            log.warning(f"Clip request ZMQ error: {e}. Recreating socket...")
-            # Recreate socket to clear state
-            try:
-                clip_socket.setsockopt(zmq.LINGER, 0)
-                clip_socket.close()
-            except:
-                pass
-            clip_socket = ctx_global.socket(zmq.REQ)
-            clip_socket.connect(f"tcp://{ZMQ_HOST}:5558")
-            clip_socket.setsockopt(zmq.RCVTIMEO, 15000)
-            clip_socket.setsockopt(zmq.SNDTIMEO, 5000)
-            return None
-        except Exception as e:
-            log.warning(f"Clip request failed: {e}")
-            return None
-
-ctx_global = None
 
 # ---------------------------------------------------------
 # MAIN
@@ -283,22 +273,9 @@ def main():
     sub_health.connect(f"tcp://{ZMQ_HOST}:{ZMQ_HEALTH_PORT}")
     sub_health.setsockopt(zmq.SUBSCRIBE, HEARTBEAT)
 
-    # Clip Request Socket (REQ)
-    global clip_socket, ctx_global
-    ctx_global = ctx
-    clip_socket = ctx.socket(zmq.REQ)
-    clip_socket.connect(f"tcp://{ZMQ_HOST}:5558")
-    clip_socket.setsockopt(zmq.RCVTIMEO, 15000) # Increased to 15s
-    clip_socket.setsockopt(zmq.SNDTIMEO, 5000)
-    clip_socket.setsockopt(zmq.LINGER, 0)
-
     poller = zmq.Poller()
     poller.register(sub_viol, zmq.POLLIN)
     poller.register(sub_health, zmq.POLLIN)
-
-    # Start Clip Worker
-    worker = threading.Thread(target=clip_worker_thread, daemon=True)
-    worker.start()
 
     conn = get_db()
     
@@ -390,17 +367,6 @@ def main():
                     except Exception as e:
                         log.error(f"Failed to save evidence JPEG: {e}")
                 
-                # 4. Queue Video Clip Request (Asynchronous)
-                ts_str = datetime.fromtimestamp(v.timestamp).strftime("%Y%m%d_%H%M%S")
-                mp4_fname = f"{v.cam_id}_{ts_str}_{v.person_name.replace(' ','_')}.mp4"
-                possible_mp4_path = os.path.join(EVIDENCE_DIR, mp4_fname)
-                
-                with clip_worker_lock:
-                    clip_queue.append((v.cam_id, v.timestamp, v.person_name, possible_mp4_path))
-                
-                # If we expect a clip, we set the path now (it will be filled later)
-                # This ensures the DB record points to where the file WILL be.
-                ev_path = possible_mp4_path if not ev_path else ev_path
 
                 # 5. Save to DB
                 pos_str = f"{v.position[0]},{v.position[1]}" if v.position and len(v.position)>=2 else ""
