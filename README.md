@@ -1,4 +1,4 @@
-# Edge AI Security System — v5 (Unified Web Management)
+# Edge AI Security System — v6 (Unified Web Management)
 
 A comprehensive edge-based security system featuring multi-camera AI analysis, personnel identity management, and secure remote access.
 
